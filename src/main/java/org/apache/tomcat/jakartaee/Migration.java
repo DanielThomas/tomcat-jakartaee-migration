@@ -89,6 +89,8 @@ public class Migration {
     }
 
     private EESpecProfile profile = EESpecProfile.TOMCAT;
+
+    private boolean enableDefaultExcludes = true;
     private boolean zipInMemory;
     private File source;
     private File destination;
@@ -125,6 +127,10 @@ public class Migration {
         return profile;
     }
 
+    public void setEnableDefaultExcludes(boolean enableDefaultExcludes) {
+        this.enableDefaultExcludes = enableDefaultExcludes;
+    }
+
     public void setZipInMemory(boolean zipInMemory) {
         this.zipInMemory = zipInMemory;
     }
@@ -147,32 +153,38 @@ public class Migration {
     }
 
 
-    public void execute() throws IOException {
+    public boolean execute() throws IOException {
+        boolean converted;
+
         logger.log(Level.INFO, sm.getString("migration.execute", source.getAbsolutePath(),
                 destination.getAbsolutePath(), profile.toString()));
 
         long t1 = System.nanoTime();
         if (source.isDirectory()) {
             if ((destination.exists() && destination.isDirectory()) || destination.mkdirs()) {
-                migrateDirectory(source, destination);
+                converted = migrateDirectory(source, destination);
             } else {
                 throw new IOException(sm.getString("migration.mkdirError", destination.getAbsolutePath()));
             }
         } else {
-            // Single file
+            // Single file`
             File parentDestination = destination.getAbsoluteFile().getParentFile();
             if (parentDestination.exists() || parentDestination.mkdirs()) {
-                migrateFile(source, destination);
+                converted = migrateFile(source, destination);
             } else {
                 throw new IOException(sm.getString("migration.mkdirError", parentDestination.getAbsolutePath()));
             }
         }
         logger.log(Level.INFO, sm.getString("migration.done",
-                Long.valueOf(TimeUnit.MILLISECONDS.convert(System.nanoTime() - t1, TimeUnit.NANOSECONDS))));
+                TimeUnit.MILLISECONDS.convert(System.nanoTime() - t1, TimeUnit.NANOSECONDS)));
+
+        return converted;
     }
 
 
-    private void migrateDirectory(File src, File dest) throws IOException {
+    private boolean migrateDirectory(File src, File dest) throws IOException {
+        boolean converted = false;
+
         // Won't return null because src is known to be a directory
         String[] files = src.list();
         for (String file : files) {
@@ -180,39 +192,47 @@ public class Migration {
             File destFile = new File(dest, file);
             if (srcFile.isDirectory()) {
                 if ((destFile.exists() && destFile.isDirectory()) || destFile.mkdir()) {
-                    migrateDirectory(srcFile, destFile);
+                    converted = converted | migrateDirectory(srcFile, destFile);
                 } else {
                     throw new IOException(sm.getString("migration.mkdirError", destFile.getAbsolutePath()));
                 }
             } else {
-                migrateFile(srcFile, destFile);
+                converted = converted | migrateFile(srcFile, destFile);
             }
         }
+
+        return converted;
     }
 
 
-    private void migrateFile(File src, File dest) throws IOException {
+    private boolean migrateFile(File src, File dest) throws IOException {
+        boolean converted;
+
         boolean inplace = src.equals(dest);
         if (!inplace) {
             try (InputStream is = new FileInputStream(src);
                     OutputStream os = new FileOutputStream(dest)) {
-                migrateStream(src.getName(), is, os);
+                converted = migrateStream(src.getName(), is, os);
             }
         } else {
             ByteArrayOutputStream buffer = new ByteArrayOutputStream((int) (src.length() * 1.05));
 
             try (InputStream is = new FileInputStream(src)) {
-                migrateStream(src.getName(), is, buffer);
+                converted = migrateStream(src.getName(), is, buffer);
             }
 
             try (OutputStream os = new FileOutputStream(dest)) {
                 os.write(buffer.toByteArray());
             }
         }
+
+        return converted;
     }
 
 
-    private void migrateArchiveStreaming(InputStream src, OutputStream dest) throws IOException {
+    private boolean migrateArchiveStreaming(InputStream src, OutputStream dest) throws IOException {
+        boolean converted = false;
+
         try (ZipArchiveInputStream srcZipStream = new ZipArchiveInputStream(CloseShieldInputStream.wrap(src));
                 ZipArchiveOutputStream destZipStream = new ZipArchiveOutputStream(CloseShieldOutputStream.wrap(dest))) {
             ZipArchiveEntry srcZipEntry;
@@ -226,7 +246,7 @@ public class Migration {
                 String destName = profile.convert(srcName);
                 if (srcZipEntry.getMethod() == ZipEntry.STORED) {
                     ByteArrayOutputStream tempBuffer = new ByteArrayOutputStream((int) (srcZipEntry.getSize() * 1.05));
-                    migrateStream(srcName, srcZipStream, tempBuffer);
+                    converted = converted | migrateStream(srcName, srcZipStream, tempBuffer);
                     crc32.update(tempBuffer.toByteArray(), 0, tempBuffer.size());
                     MigrationZipArchiveEntry destZipEntry = new MigrationZipArchiveEntry(srcZipEntry);
                     destZipEntry.setName(destName);
@@ -240,15 +260,19 @@ public class Migration {
                     MigrationZipArchiveEntry destZipEntry = new MigrationZipArchiveEntry(srcZipEntry);
                     destZipEntry.setName(destName);
                     destZipStream.putArchiveEntry(destZipEntry);
-                    migrateStream(srcName, srcZipStream, destZipStream);
+                    converted = converted | migrateStream(srcName, srcZipStream, destZipStream);
                     destZipStream.closeArchiveEntry();
                 }
             }
         }
+
+        return converted;
     }
 
 
-    private void migrateArchiveInMemory(InputStream src, OutputStream dest) throws IOException {
+    private boolean migrateArchiveInMemory(InputStream src, OutputStream dest) throws IOException {
+        boolean converted = false;
+
         // Read the source into memory
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         IOUtils.copy(src, baos);
@@ -271,7 +295,7 @@ public class Migration {
                 MigrationZipArchiveEntry destZipEntry = new MigrationZipArchiveEntry(srcZipEntry);
                 destZipEntry.setName(destName);
                 destZipStream.putArchiveEntry(destZipEntry);
-                migrateStream(srcName, srcZipFile.getInputStream(srcZipEntry), destZipStream);
+                converted = converted | migrateStream(srcName, srcZipFile.getInputStream(srcZipEntry), destZipStream);
                 destZipStream.closeArchiveEntry();
             }
         }
@@ -279,6 +303,8 @@ public class Migration {
         // Write the destination back to the stream
         ByteArrayInputStream bais = new ByteArrayInputStream(destByteChannel.array(), 0, (int) destByteChannel.size());
         IOUtils.copy(bais, dest);
+
+        return converted;
     }
 
 
@@ -292,28 +318,32 @@ public class Migration {
     }
 
 
-    private void migrateStream(String name, InputStream src, OutputStream dest) throws IOException {
+    private boolean migrateStream(String name, InputStream src, OutputStream dest) throws IOException {
+        boolean converted = false;
+
         if (isExcluded(name)) {
             Util.copy(src, dest);
             logger.log(Level.INFO, sm.getString("migration.skip", name));
         } else if (isArchive(name)) {
             if (zipInMemory) {
                 logger.log(Level.INFO, sm.getString("migration.archive.memory", name));
-                migrateArchiveInMemory(src, dest);
+                converted = migrateArchiveInMemory(src, dest);
                 logger.log(Level.INFO, sm.getString("migration.archive.complete", name));
             } else {
                 logger.log(Level.INFO, sm.getString("migration.archive.stream", name));
-                migrateArchiveStreaming(src, dest);
+                converted = migrateArchiveStreaming(src, dest);
                 logger.log(Level.INFO, sm.getString("migration.archive.complete", name));
             }
         } else {
             for (Converter converter : converters) {
                 if (converter.accepts(name)) {
-                    converter.convert(name, src, dest, profile);
+                    converted = converted | converter.convert(name, src, dest, profile);
                     break;
                 }
             }
         }
+
+        return converted;
     }
 
 
@@ -326,7 +356,7 @@ public class Migration {
         File f = new File(name);
         String filename = f.getName();
 
-        if (GlobMatcher.matchName(DEFAULT_EXCLUDES, filename, true)) {
+        if (enableDefaultExcludes && GlobMatcher.matchName(DEFAULT_EXCLUDES, filename, true)) {
             return true;
         }
 
